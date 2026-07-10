@@ -1,184 +1,227 @@
-import os
-import sqlite3
-from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
-
-# تحديد ملف قاعدة البيانات داخل Railway
-DB_PATH = "almajed.db"
+from flask_cors import CORS
+import psycopg2
+import os
 
 app = Flask(__name__)
+CORS(app)
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# الاتصال بقاعدة البيانات على Railway
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def init_db():
-    conn = get_conn()
-    cursor = conn.cursor()
+def db():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            password TEXT,
-            role TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_name TEXT,
-            booking_date TEXT,
-            customer_name TEXT,
-            customer_phone TEXT,
-            men_days TEXT,
-            men_dates TEXT,
-            men_time TEXT,
-            women_days TEXT,
-            women_dates TEXT,
-            women_time TEXT,
-            total_amount REAL,
-            paid_amount REAL,
-            remaining_amount REAL
-        )
-    """)
-
-    cursor.execute("SELECT COUNT(*) FROM users")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("""
-            INSERT INTO users (username, password, role)
-            VALUES ('admin', '1234', 'admin')
-        """)
-
-    conn.commit()
-    conn.close()
-
-init_db()
-
-@app.route("/")
-def index():
-    return jsonify({"status": "ok", "msg": "Almajed Hall API is running"})
-
-@app.route("/login", methods=["POST"])
+# -----------------------------
+# تسجيل الدخول
+# -----------------------------
+@app.post("/login")
 def login():
-    data = request.get_json()
-    username = data.get("username", "")
-    password = data.get("password", "")
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
 
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT role FROM users WHERE username=? AND password=?", (username, password))
-    row = cursor.fetchone()
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT role FROM users WHERE username=%s AND password=%s", (username, password))
+    row = cur.fetchone()
     conn.close()
 
     if row:
-        return jsonify({"status": "ok", "role": row["role"]})
-    return jsonify({"status": "error", "msg": "اسم المستخدم أو كلمة المرور غير صحيحة"}), 401
+        return jsonify({"status": "ok", "role": row[0]})
+    return jsonify({"status": "error"})
 
-@app.route("/bookings", methods=["POST"])
+
+# -----------------------------
+# إضافة مستخدم
+# -----------------------------
+@app.post("/add_user")
+def add_user():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
+    role = data.get("role")
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
+                (username, password, role))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"status": "ok"})
+
+
+# -----------------------------
+# حفظ الحجز
+# -----------------------------
+@app.post("/bookings")
 def save_booking():
-    data = request.get_json()
+    data = request.json
 
-    conn = get_conn()
-    cursor = conn.cursor()
+    conn = db()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         INSERT INTO bookings (
             event_name, booking_date, customer_name, customer_phone,
             men_days, men_dates, men_time,
             women_days, women_dates, women_time,
-            total_amount, paid_amount, remaining_amount
+            total_amount, paid_amount, remaining_amount,
+            notes, created_by
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id
     """, (
-        data.get("event_name"),
-        data.get("booking_date"),
-        data.get("customer_name"),
-        data.get("customer_phone"),
-        data.get("men_days"),
-        data.get("men_dates"),
-        data.get("men_time"),
-        data.get("women_days"),
-        data.get("women_dates"),
-        data.get("women_time"),
-        float(data.get("total_amount", 0)),
-        float(data.get("paid_amount", 0)),
-        float(data.get("remaining_amount", 0)),
+        data["event_name"], data["booking_date"], data["customer_name"], data["customer_phone"],
+        data["men_days"], data["men_dates"], data["men_time"],
+        data["women_days"], data["women_dates"], data["women_time"],
+        data["total_amount"], data["paid_amount"], data["remaining_amount"],
+        data["notes"], data["created_by"]
     ))
 
-    new_id = cursor.lastrowid
+    booking_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
 
-    return jsonify({"status": "ok", "invoice_id": new_id})
+    return jsonify({"status": "ok", "id": booking_id})
 
-@app.route("/bookings/<int:booking_id>", methods=["GET"])
+
+# -----------------------------
+# البحث
+# -----------------------------
+@app.get("/search")
+def search():
+    q = request.args.get("q", "")
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, customer_name, customer_phone, booking_date, event_name
+        FROM bookings
+        WHERE customer_name ILIKE %s OR customer_phone ILIKE %s OR booking_date ILIKE %s
+    """, (f"%{q}%", f"%{q}%", f"%{q}%"))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    results = []
+    for r in rows:
+        results.append({
+            "id": r[0],
+            "customer_name": r[1],
+            "customer_phone": r[2],
+            "booking_date": r[3],
+            "event_name": r[4]
+        })
+
+    return jsonify({"results": results})
+
+
+# -----------------------------
+# جلب حجز واحد
+# -----------------------------
+@app.get("/bookings/<int:booking_id>")
 def get_booking(booking_id):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM bookings WHERE id=?", (booking_id,))
-    row = cursor.fetchone()
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM bookings WHERE id=%s
+    """, (booking_id,))
+    row = cur.fetchone()
     conn.close()
 
     if not row:
-        return jsonify({"status": "error", "msg": "الحجز غير موجود"}), 404
+        return jsonify({"status": "not_found"})
 
-    return jsonify({"status": "ok", "booking": dict(row)})
+    keys = [
+        "id", "event_name", "booking_date", "customer_name", "customer_phone",
+        "men_days", "men_dates", "men_time",
+        "women_days", "women_dates", "women_time",
+        "total_amount", "paid_amount", "remaining_amount",
+        "notes", "created_by"
+    ]
 
-@app.route("/search", methods=["GET"])
-def search_booking():
-    q = request.args.get("q", "")
+    booking = dict(zip(keys, row))
 
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, customer_name, customer_phone, booking_date, event_name
-        FROM bookings
-        WHERE customer_name LIKE ? OR customer_phone LIKE ? OR booking_date LIKE ?
-    """, (f"%{q}%", f"%{q}%", f"%{q}%"))
-    rows = cursor.fetchall()
-    conn.close()
+    return jsonify({"booking": booking})
 
-    return jsonify({"status": "ok", "results": [dict(r) for r in rows]})
 
-@app.route("/report/daily", methods=["GET"])
-def daily_report():
-    date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+# -----------------------------
+# تقرير يومي
+# -----------------------------
+@app.get("/report/daily")
+def report_daily():
+    date = request.args.get("date")
 
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("""
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
         SELECT id, customer_name, event_name, booking_date,
                men_days, men_time, women_days, women_time
         FROM bookings
-        WHERE booking_date = ?
-    """, (date_str,))
-    rows = cursor.fetchall()
+        WHERE booking_date=%s
+    """, (date,))
+
+    rows = cur.fetchall()
     conn.close()
 
-    return jsonify({"status": "ok", "results": [dict(r) for r in rows]})
+    results = []
+    for r in rows:
+        results.append({
+            "id": r[0],
+            "customer_name": r[1],
+            "event_name": r[2],
+            "booking_date": r[3],
+            "men_days": r[4],
+            "men_time": r[5],
+            "women_days": r[6],
+            "women_time": r[7],
+        })
 
-@app.route("/report/weekly", methods=["GET"])
-def weekly_report():
-    start = request.args.get("start", datetime.now().strftime("%Y-%m-%d"))
-    base_date = datetime.strptime(start, "%Y-%m-%d")
+    return jsonify({"results": results})
 
-    week_dates = [(base_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
 
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(f"""
+# -----------------------------
+# تقرير أسبوعي
+# -----------------------------
+@app.get("/report/weekly")
+def report_weekly():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
         SELECT id, customer_name, event_name, booking_date,
                men_days, men_time, women_days, women_time
         FROM bookings
-        WHERE booking_date IN ({','.join(['?']*7)})
-    """, week_dates)
-    rows = cursor.fetchall()
+        ORDER BY booking_date DESC
+        LIMIT 50
+    """)
+
+    rows = cur.fetchall()
     conn.close()
 
-    return jsonify({"status": "ok", "results": [dict(r) for r in rows]})
+    results = []
+    for r in rows:
+        results.append({
+            "id": r[0],
+            "customer_name": r[1],
+            "event_name": r[2],
+            "booking_date": r[3],
+            "men_days": r[4],
+            "men_time": r[5],
+            "women_days": r[6],
+            "women_time": r[7],
+        })
+
+    return jsonify({"results": results})
+
+
+# -----------------------------
+# تشغيل السيرفر
+# -----------------------------
+@app.get("/")
+def home():
+    return "Server is running!"
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=8000)
